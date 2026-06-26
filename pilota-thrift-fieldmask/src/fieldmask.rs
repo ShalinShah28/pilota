@@ -557,7 +557,11 @@ impl FieldMaskData {
 )]
 pub struct FieldMask {
     is_black: bool, // black list mode flag
-    data: FieldMaskData,
+    // The mask tree is stored behind an `Arc` so that `FieldMask::clone()` is O(1)
+    // (an `is_black` copy + a refcount bump) and the entire subtree is shared on
+    // clone. During build the `Arc` is uniquely owned, so `Arc::make_mut` mutates
+    // in place (copy-on-write never triggers a deep copy on the hot read path).
+    data: ::std::sync::Arc<FieldMaskData>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -609,13 +613,13 @@ impl FieldMaskBuilder {
 
 impl FieldMask {
     pub fn reset(&mut self) {
-        self.data = FieldMaskData::Invalid;
+        self.data = ::std::sync::Arc::new(FieldMaskData::Invalid);
     }
 
     // default mode: include if field mask exists
     // black mode: include if field mask exists and not `all` mode
     pub fn exist(&self) -> bool {
-        match &self.data {
+        match self.data.as_ref() {
             FieldMaskData::Invalid => self.is_black,
             FieldMaskData::Scalar => !self.is_black,
             FieldMaskData::Struct { .. }
@@ -627,7 +631,7 @@ impl FieldMask {
 
     pub fn field(&self, id: i32) -> (Option<&FieldMask>, bool) {
         // (field_fm, is_exist)
-        match &self.data {
+        match self.data.as_ref() {
             FieldMaskData::Struct { children, .. } => {
                 let field_fm = children.get(&id).map(|f| f.as_ref());
                 // default mode: include if field exists or self is `all` mode
@@ -645,7 +649,7 @@ impl FieldMask {
     }
 
     pub fn int(&self, id: i32) -> (Option<&FieldMask>, bool) {
-        match &self.data {
+        match self.data.as_ref() {
             FieldMaskData::List {
                 children, wildcard, ..
             } => {
@@ -675,7 +679,7 @@ impl FieldMask {
     }
 
     pub fn str(&self, id: &str) -> (Option<&FieldMask>, bool) {
-        match &self.data {
+        match self.data.as_ref() {
             FieldMaskData::StrMap {
                 children, wildcard, ..
             } => {
@@ -693,7 +697,7 @@ impl FieldMask {
     }
 
     pub fn wildcard(&self) -> (Option<&FieldMask>, bool) {
-        let item_fm = match &self.data {
+        let item_fm = match self.data.as_ref() {
             FieldMaskData::List { wildcard, .. }
             | FieldMaskData::StrMap { wildcard, .. }
             | FieldMaskData::IntMap { wildcard, .. } => wildcard.as_ref().map(|v| v.as_ref()),
@@ -721,7 +725,7 @@ impl FieldMask {
     where
         F: FnMut(&str, i32, &FieldMask) -> bool,
     {
-        match &self.data {
+        match self.data.as_ref() {
             FieldMaskData::Scalar | FieldMaskData::Invalid => (),
             FieldMaskData::Struct { children, .. } => {
                 for (&k, v) in children {
@@ -783,7 +787,7 @@ impl FieldMask {
                                 }),
                             })?;
 
-                    if !matches!(cur_fm.data, FieldMaskData::Struct { .. }) && !cur_fm.all() {
+                    if !matches!(*cur_fm.data, FieldMaskData::Struct { .. }) && !cur_fm.all() {
                         return Err(FieldMaskError::TypeMismatch {
                             detail: Box::new(TypeMismatchDetail {
                                 expected: "Struct".into(),
@@ -848,7 +852,7 @@ impl FieldMask {
                         }
                     })?;
 
-                    if !matches!(cur_fm.data, FieldMaskData::List { .. }) && !cur_fm.all() {
+                    if !matches!(*cur_fm.data, FieldMaskData::List { .. }) && !cur_fm.all() {
                         return Err(FieldMaskError::TypeMismatch {
                             detail: Box::new(TypeMismatchDetail {
                                 expected: "List".into(),
@@ -939,7 +943,7 @@ impl FieldMask {
                     })?;
 
                     if !matches!(
-                        cur_fm.data,
+                        *cur_fm.data,
                         FieldMaskData::StrMap { .. } | FieldMaskData::IntMap { .. }
                     ) && !cur_fm.all()
                     {
@@ -1060,23 +1064,31 @@ impl FieldMask {
     #[inline]
     fn mut_wildcard(&mut self, data: FieldMaskData) -> &mut FieldMask {
         let is_black = self.is_black;
-        let wildcard = match &mut self.data {
+        let wildcard = match ::std::sync::Arc::make_mut(&mut self.data) {
             FieldMaskData::List { wildcard, .. } => wildcard,
             FieldMaskData::StrMap { wildcard, .. } => wildcard,
             FieldMaskData::IntMap { wildcard, .. } => wildcard,
             other => panic!("Cannot set wildcard on {:?}", other.type_name()),
         };
 
-        wildcard.get_or_insert_with(|| Box::new(FieldMask { is_black, data }))
+        wildcard.get_or_insert_with(|| {
+            Box::new(FieldMask {
+                is_black,
+                data: ::std::sync::Arc::new(data),
+            })
+        })
     }
 
     #[inline]
     fn set_and_get_sub_field(&mut self, id: i32, data: FieldMaskData) -> &mut FieldMask {
         let is_black = self.is_black;
-        match &mut self.data {
-            FieldMaskData::Struct { children, .. } => children
-                .entry(id)
-                .or_insert_with(|| Box::new(FieldMask { is_black, data })),
+        match ::std::sync::Arc::make_mut(&mut self.data) {
+            FieldMaskData::Struct { children, .. } => children.entry(id).or_insert_with(|| {
+                Box::new(FieldMask {
+                    is_black,
+                    data: ::std::sync::Arc::new(data),
+                })
+            }),
             other => panic!("Cannot set field_id on {:?}", other.type_name()),
         }
     }
@@ -1084,11 +1096,14 @@ impl FieldMask {
     #[inline]
     fn set_int_key_mask(&mut self, id: i32, data: FieldMaskData) -> &mut FieldMask {
         let is_black = self.is_black;
-        match &mut self.data {
+        match ::std::sync::Arc::make_mut(&mut self.data) {
             FieldMaskData::List { children, .. } | FieldMaskData::IntMap { children, .. } => {
-                children
-                    .entry(id)
-                    .or_insert_with(|| Box::new(FieldMask { is_black, data }))
+                children.entry(id).or_insert_with(|| {
+                    Box::new(FieldMask {
+                        is_black,
+                        data: ::std::sync::Arc::new(data),
+                    })
+                })
             }
             other => panic!("Cannot set int on {:?}", other.type_name()),
         }
@@ -1097,10 +1112,13 @@ impl FieldMask {
     #[inline]
     fn set_str_key_mask(&mut self, id: FastStr, data: FieldMaskData) -> &mut FieldMask {
         let is_black = self.is_black;
-        match &mut self.data {
-            FieldMaskData::StrMap { children, .. } => children
-                .entry(id)
-                .or_insert_with(|| Box::new(FieldMask { is_black, data })),
+        match ::std::sync::Arc::make_mut(&mut self.data) {
+            FieldMaskData::StrMap { children, .. } => children.entry(id).or_insert_with(|| {
+                Box::new(FieldMask {
+                    is_black,
+                    data: ::std::sync::Arc::new(data),
+                })
+            }),
             other => panic!("Cannot set str on {:?}", other.type_name()),
         }
     }
@@ -1129,15 +1147,15 @@ impl FieldMask {
     ) -> Result<(), FieldMaskError> {
         // if no more tokens for nested path, set as all
         if !it.has_next() {
-            self.data.set_all()?;
+            ::std::sync::Arc::make_mut(&mut self.data).set_all()?;
             return Ok(());
         }
 
         let token = it.next();
         match &token.data {
             TokenData::Root => {
-                if let FieldMaskData::Invalid = self.data {
-                    self.data = FieldMaskData::new(cur_desc);
+                if let FieldMaskData::Invalid = self.data.as_ref() {
+                    self.data = ::std::sync::Arc::new(FieldMaskData::new(cur_desc));
                 }
                 self.add_path(it, cur_desc, original_path)
             }
@@ -1179,7 +1197,7 @@ impl FieldMask {
             }
         };
 
-        if !matches!(self.data, FieldMaskData::Struct { .. }) {
+        if !matches!(*self.data, FieldMaskData::Struct { .. }) {
             return Err(FieldMaskError::TypeMismatch {
                 detail: Box::new(TypeMismatchDetail {
                     expected: "Struct".into(),
@@ -1237,7 +1255,7 @@ impl FieldMask {
                 sub_mask.add_path(it, &field.r#type, original_path)
             }
             TokenData::Any => {
-                self.data.set_all()?;
+                ::std::sync::Arc::make_mut(&mut self.data).set_all()?;
                 Ok(())
             }
             _ => Err(FieldMaskError::InvalidToken {
@@ -1258,7 +1276,7 @@ impl FieldMask {
         cur_desc: &TypeDescriptor,
         original_path: &FastStr,
     ) -> Result<(), FieldMaskError> {
-        if !matches!(self.data, FieldMaskData::List { .. }) {
+        if !matches!(*self.data, FieldMaskData::List { .. }) {
             return Err(FieldMaskError::TypeMismatch {
                 detail: Box::new(TypeMismatchDetail {
                     expected: "List".into(),
@@ -1354,8 +1372,8 @@ impl FieldMask {
         cur_desc: &TypeDescriptor,
         original_path: &FastStr,
     ) -> Result<(), FieldMaskError> {
-        let is_str_map = matches!(self.data, FieldMaskData::StrMap { .. });
-        let is_int_map = matches!(self.data, FieldMaskData::IntMap { .. });
+        let is_str_map = matches!(*self.data, FieldMaskData::StrMap { .. });
+        let is_int_map = matches!(*self.data, FieldMaskData::IntMap { .. });
 
         if !is_str_map && !is_int_map {
             return Err(FieldMaskError::TypeMismatch {
@@ -1532,19 +1550,19 @@ mod tests {
 
         let mut children = AHashMap::new();
         let mut child1 = FieldMask::default();
-        child1.data = FieldMaskData::Scalar;
+        child1.data = Arc::new(FieldMaskData::Scalar);
         let mut child2 = FieldMask::default();
-        child2.data = FieldMaskData::List {
+        child2.data = Arc::new(FieldMaskData::List {
             children: AHashMap::new(),
             wildcard: None,
             is_all: false,
-        };
+        });
         children.insert(1, Box::new(child1));
         children.insert(2, Box::new(child2));
-        fm.data = FieldMaskData::Struct {
+        fm.data = Arc::new(FieldMaskData::Struct {
             children,
             is_all: false,
-        };
+        });
         let mut count = 0;
         fm.for_each_child(|_, id, mask| {
             match id {

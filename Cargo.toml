@@ -49,7 +49,7 @@ rayon = "1"
 rustc-hash = "1"
 salsa = { version = "0.23.0" }
 scoped-tls = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_yaml = "0.9"
 smallvec = "1"
 syn = "2"
